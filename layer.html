@@ -58,7 +58,7 @@ const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl:
 let ctx, music, stream, merger, dest, recBlob, meterTimer, wakeLock, part = null;
 let sources = [];
 
-$('title').textContent = claps ? 'Проверка звука' : `🥐 ${query.get('title') || 'Слоёная песня'}`;
+$('title').textContent = claps ? '🔊 Проверка звука' : `🥐 ${query.get('title') || 'Слоёная песня'}`;
 const START = claps ? '⏺ Начать' : '⏺ Петь';
 const AGAIN = claps ? '⏺ Ещё раз' : '⏺ Спеть заново';
 $('b-rec').textContent = START;
