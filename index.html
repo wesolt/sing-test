@@ -13,6 +13,7 @@
   #status { font-weight: 600; margin: 8px 0; }
   #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
   #meter div { height: 100%; width: 0; background: #3a8f3a; }
+  select { width: 100%; margin: 8px 0; padding: 12px; font-size: 16px; border-radius: 10px; }
   #log { width: 100%; box-sizing: border-box; height: 220px; font: 12px/1.35 ui-monospace, monospace; border: 0; border-radius: 8px; padding: 8px; }
 </style>
 
@@ -21,8 +22,8 @@
 <p id="status">Наденьте наушники и нажимайте кнопки по порядку.</p>
 
 <button id="b-music">1. ▶️ Музыка без микрофона</button>
-<button id="b-mic">2. 🎤 Микрофон наушников</button>
-<button id="b-phone">2б. 📱 Микрофон телефона</button>
+<button id="b-mic">2. 🎤 Включить микрофон</button>
+<select id="mic-pick" disabled><option value="">Микрофон по умолчанию</option></select>
 <p class="small" id="mic">Микрофон выключен</p>
 <div id="meter"><div></div></div>
 <button id="b-rec" disabled>3. ⏺ Петь под музыку</button>
@@ -133,6 +134,12 @@ async function showMic() {
   log('пишет:', track.label, JSON.stringify(track.getSettings()));
   const devices = await navigator.mediaDevices.enumerateDevices();
   log('устройства:', devices.map(d => `${d.kind}:${d.label || '?'}`).join(' | '));
+  // Названия микрофонов видны только после разрешения — тогда и заполняем список.
+  const pick = $('mic-pick'), current = track.getSettings().deviceId;
+  pick.innerHTML = '';
+  devices.filter(d => d.kind === 'audioinput').forEach(d =>
+    pick.add(new Option(`🎤 ${d.label || d.deviceId}`, d.deviceId, false, d.deviceId === current)));
+  pick.disabled = false;
 }
 
 if (navigator.mediaDevices) {
@@ -143,25 +150,24 @@ if (navigator.mediaDevices) {
 // уводят звук из наушников в динамик.
 const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 
-// Микрофон наушников переводит Bluetooth в режим звонка и портит звук в ушах.
-// Проверяем, остаётся ли качество, если писать встроенным микрофоном телефона.
-async function phoneMic() {
-  const probe = await navigator.mediaDevices.getUserMedia({ audio: RAW });
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  probe.getTracks().forEach(t => t.stop());
-  const phone = devices.find(d => d.kind === 'audioinput' && /iphone|встро|built-in|телефон|phone/i.test(d.label));
-  log('микрофон телефона:', phone ? phone.label : 'не найден');
-  if (!phone) throw new Error('встроенный микрофон не найден');
-  return navigator.mediaDevices.getUserMedia({ audio: { ...RAW, deviceId: { exact: phone.deviceId } } });
+// Микрофон Bluetooth-наушников переводит их в режим звонка и портит звук в ушах.
+// На компьютере можно писать другим микрофоном — выбор в списке.
+$('b-mic').onclick = () => openMic($('mic-pick').value);
+$('mic-pick').onchange = () => stream && openMic($('mic-pick').value);
+
+function closeMic() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  clearInterval(meterTimer);
+  $('meter').firstChild.style.width = 0;
+  $('b-rec').disabled = true;
 }
 
-$('b-mic').onclick = () => openMic(false);
-$('b-phone').onclick = () => openMic(true);
-
-async function openMic(usePhone) {
+async function openMic(deviceId) {
   audio();
+  closeMic();
   try {
-    stream = usePhone ? await phoneMic() : await navigator.mediaDevices.getUserMedia({ audio: RAW });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: deviceId ? { ...RAW, deviceId: { exact: deviceId } } : RAW });
   } catch (e) {
     log('микрофон НЕ дали:');
     fail(e);
@@ -194,8 +200,9 @@ async function openMic(usePhone) {
   $('b-off').disabled = false;
   $('b-rec').textContent = '⏳ Микрофон прогревается…';
   status('Микрофон включён, прогревается.');
+  const warming = stream;
   setTimeout(() => {
-    if (!stream) return;
+    if (stream !== warming) return;
     $('b-rec').textContent = '3. ⏺ Петь под музыку';
     $('b-rec').disabled = false;
     status('Можно петь.');
@@ -269,10 +276,7 @@ $('b-send').onclick = async () => {
 
 $('b-off').onclick = () => {
   stopAll();
-  stream.getTracks().forEach(t => t.stop());
-  stream = null;
-  clearInterval(meterTimer);
-  $('meter').firstChild.style.width = 0;
+  closeMic();
   // Новый AudioContext — чтобы iOS могла вернуть наушники из режима звонка.
   ctx.close();
   ctx = null;
