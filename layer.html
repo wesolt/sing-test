@@ -37,9 +37,10 @@
 
 <script>
 // Страница «Слоёной песни». Бот кладёт в адрес подписанные ссылки: `guide` —
-// скачать фонограмму, `put` и `meta` — загрузить запись и отметку. Запись
-// идёт прямо в хранилище, сервер в ней не участвует. Подробности —
-// docs/layer_song.md в folk_base.
+// скачать фонограмму, `post` и `form` — подписанная форма загрузки: пускает
+// только в папку этого человека и не больше лимита, имя файлу даёт страница,
+// поэтому каждая отправка — новая запись. Запись идёт прямо в хранилище,
+// сервер в ней не участвует. Подробности — docs/layer_song.md в folk_base.
 const $ = id => document.getElementById(id);
 const query = new URLSearchParams(location.search);
 const launch = new URLSearchParams(location.hash.slice(1));
@@ -257,15 +258,18 @@ $('b-send').onclick = async () => {
   };
   try {
     // Сначала запись, потом отметка: бот берёт запись, только когда видит отметку.
-    for (const [url, body] of [[query.get('put'), recBlob], [query.get('meta'), JSON.stringify(meta)]]) {
-      const response = await fetch(url, { method: 'PUT', body });
+    const fields = JSON.parse(query.get('form'));
+    const name = new Date().toISOString().replace(/\D/g, '').slice(0, 14) + '-' + Math.random().toString(36).slice(2, 8);
+    for (const [ext, body] of [['.take', recBlob], ['.json', new Blob([JSON.stringify(meta)])]]) {
+      const form = new FormData();
+      for (const [field, value] of Object.entries(fields)) {
+        form.append(field, field === 'key' ? value.replace('${filename}', name + ext) : value);
+      }
+      form.append('file', body);
+      const response = await fetch(query.get('post'), { method: 'POST', body: form });
       if (!response.ok) throw new Error(`хранилище ответило ${response.status}`);
     }
-    // Ключи в ссылках одноразовые: бот уже мог забрать эту запись, и
-    // повторная отправка по ним потерялась бы. Перепеть — новой страницей.
-    $('b-rec').disabled = true;
-    $('b-mic').disabled = true;
-    status('✅ Отправлено. Бот проверит запись и напишет в личку. Страницу можно закрыть, а чтобы перепеть — открыть заново из бота.');
+    status('✅ Отправлено. Бот проверит запись и напишет в личку. Страницу можно закрыть.');
   } catch (e) {
     log('не отправилось', e.message);
     status('Не отправилось. Проверьте интернет и нажмите ещё раз.');
