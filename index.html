@@ -21,7 +21,8 @@
 <p id="status">Наденьте наушники и нажимайте кнопки по порядку.</p>
 
 <button id="b-music">1. ▶️ Музыка без микрофона</button>
-<button id="b-mic">2. 🎤 Включить микрофон</button>
+<button id="b-mic">2. 🎤 Микрофон наушников</button>
+<button id="b-phone">2б. 📱 Микрофон телефона</button>
 <p class="small" id="mic">Микрофон выключен</p>
 <div id="meter"><div></div></div>
 <button id="b-rec" disabled>3. ⏺ Петь под музыку</button>
@@ -138,14 +139,29 @@ if (navigator.mediaDevices) {
   navigator.mediaDevices.addEventListener('devicechange', () => { log('devicechange'); showMic(); });
 }
 
-$('b-mic').onclick = async () => {
+// Шумоподавление и автогромкость портят пение и, по отчётам WebKit,
+// уводят звук из наушников в динамик.
+const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+
+// Микрофон наушников переводит Bluetooth в режим звонка и портит звук в ушах.
+// Проверяем, остаётся ли качество, если писать встроенным микрофоном телефона.
+async function phoneMic() {
+  const probe = await navigator.mediaDevices.getUserMedia({ audio: RAW });
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  probe.getTracks().forEach(t => t.stop());
+  const phone = devices.find(d => d.kind === 'audioinput' && /iphone|встро|built-in|телефон|phone/i.test(d.label));
+  log('микрофон телефона:', phone ? phone.label : 'не найден');
+  if (!phone) throw new Error('встроенный микрофон не найден');
+  return navigator.mediaDevices.getUserMedia({ audio: { ...RAW, deviceId: { exact: phone.deviceId } } });
+}
+
+$('b-mic').onclick = () => openMic(false);
+$('b-phone').onclick = () => openMic(true);
+
+async function openMic(usePhone) {
   audio();
   try {
-    // Шумоподавление и автогромкость портят пение и, по отчётам WebKit,
-    // уводят звук из наушников в динамик.
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
+    stream = usePhone ? await phoneMic() : await navigator.mediaDevices.getUserMedia({ audio: RAW });
   } catch (e) {
     log('микрофон НЕ дали:');
     fail(e);
@@ -174,6 +190,7 @@ $('b-mic').onclick = async () => {
   }, 100);
 
   await showMic();
+  log('outputLatency с микрофоном:', ctx.outputLatency);
   $('b-off').disabled = false;
   $('b-rec').textContent = '⏳ Микрофон прогревается…';
   status('Микрофон включён, прогревается.');
