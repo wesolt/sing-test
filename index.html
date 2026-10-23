@@ -8,25 +8,27 @@
   h3 { margin: 0 0 .5rem; }
   button { display: block; width: 100%; margin: 8px 0; padding: 14px; font-size: 17px; border: 0; border-radius: 10px; background: #7a3d92; color: #fff; }
   button:disabled { opacity: .35; }
+  button.live { background: #c0392b; opacity: 1; }
   .small { font-size: 13px; color: #6b6474; }
+  #status { font-weight: 600; margin: 8px 0; }
   #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
   #meter div { height: 100%; width: 0; background: #3a8f3a; }
-  #log { width: 100%; box-sizing: border-box; height: 260px; font: 12px/1.35 ui-monospace, monospace; border: 0; border-radius: 8px; padding: 8px; }
+  #log { width: 100%; box-sizing: border-box; height: 220px; font: 12px/1.35 ui-monospace, monospace; border: 0; border-radius: 8px; padding: 8px; }
 </style>
 
 <h3>🎧 Петь под музыку в наушниках</h3>
 <p class="small" id="env"></p>
+<p id="status">Наденьте наушники и нажимайте кнопки по порядку.</p>
 
 <button id="b-music">1. ▶️ Музыка без микрофона</button>
-<p class="small">Встроенная мелодия: 4 секунды в левом ухе, 4 в правом. Можно взять свой файл:
-  <input type="file" id="file" accept="audio/*"></p>
 <button id="b-mic">2. 🎤 Включить микрофон</button>
 <p class="small" id="mic">Микрофон выключен</p>
 <div id="meter"><div></div></div>
 <button id="b-rec" disabled>3. ⏺ Петь под музыку</button>
-<button id="b-play" disabled>4. 🎧 Послушать запись</button>
-<button id="b-mix" disabled>5. 🎧 Запись вместе с музыкой</button>
-<button id="b-off" disabled>6. 🔇 Выключить микрофон</button>
+<button id="b-play" disabled>4. 🎧 Послушать голос</button>
+<button id="b-mix" disabled>5. 🎧 Голос и музыка, как записались</button>
+<button id="b-send" disabled>6. 📤 Отправить</button>
+<button id="b-off" disabled>7. 🔇 Выключить микрофон</button>
 <button id="b-copy">📋 Скопировать отчёт</button>
 <textarea id="log" readonly></textarea>
 
@@ -38,27 +40,36 @@ const log = (...parts) => {
   $('log').scrollTop = 1e9;
 };
 const fail = e => log('ОШИБКА', e && e.name, e && e.message || e);
+const status = text => { $('status').textContent = text; };
 window.onerror = message => log('ОШИБКА', message);
 window.onunhandledrejection = e => fail(e.reason);
 
-// Telegram передаёт параметры запуска Mini App в хеше адреса.
+// Telegram передаёт параметры запуска Mini App в хеше адреса,
+// бот — адреса заготовки и загрузки в query.
 const launch = new URLSearchParams(location.hash.slice(1));
+const query = new URLSearchParams(location.search);
+const guideUrl = query.get('guide');
+const putUrl = query.get('put');
 const where = launch.get('tgWebAppPlatform')
   ? `Mini App (${launch.get('tgWebAppPlatform')}, ${launch.get('tgWebAppVersion')})`
   : 'браузер';
 $('env').textContent = `Открыто: ${where}`;
-log('открыто:', where);
+log('открыто:', where, '· заготовка:', guideUrl ? 'из хранилища' : 'встроенная', '· отправка:', putUrl ? 'есть' : 'нет');
 log('ua:', navigator.userAgent);
-log('mediaDevices:', !!navigator.mediaDevices, 'MediaRecorder:', typeof MediaRecorder);
 
-let ctx, music, stream, rec, recBuf, meterTimer;
+const WARMUP = 3;   // секунд прогрева микрофона до записи: без него начало звучит «из ведра»
+const LEAD = 1;     // секунд записи до начала музыки
+const TAIL = 1.5;   // секунд записи после конца музыки
+
+let ctx, music, stream, merger, dest, rec, recBlob, recBuf, voiceBuf, meterTimer;
 let sources = [];
 
 function audio() {
   if (!ctx) {
     ctx = new (window.AudioContext || window.webkitAudioContext)();
-    ctx.onstatechange = () => log('звук:', ctx && ctx.state);
-    log('звук: частота', ctx.sampleRate, 'baseLatency', ctx.baseLatency, 'outputLatency', ctx.outputLatency);
+    const own = ctx;
+    own.onstatechange = () => log('звук:', own.state);
+    log('звук: частота', ctx.sampleRate, 'outputLatency', ctx.outputLatency);
   }
   ctx.resume();
   return ctx;
@@ -69,17 +80,18 @@ function stopAll() {
   sources = [];
 }
 
-function play(buffer) {
+function play(buffer, { when = 0, toRecord = false } = {}) {
   const src = audio().createBufferSource();
   src.buffer = buffer;
   src.connect(ctx.destination);
-  src.start();
+  if (toRecord) src.connect(merger, 0, 1);
+  src.start(ctx.currentTime + when);
   sources.push(src);
   return src;
 }
 
-// Мелодия из восьми нот по кругу: первая фраза в левом канале, вторая в правом.
-// В режиме звонка наушники становятся моно, и обе фразы слышны в обоих ушах.
+// Встроенная мелодия: первая фраза в левом канале, вторая в правом.
+// Бот кладёт в хранилище такую же, так что по ней можно мерить задержку.
 function tune() {
   const c = audio(), rate = c.sampleRate, note = Math.round(rate / 2), steps = [0, 2, 4, 5, 7, 5, 4, 2];
   const buffer = c.createBuffer(2, note * 40, rate);
@@ -94,45 +106,36 @@ function tune() {
   return buffer;
 }
 
-function getMusic() {
-  if (!music) music = tune();
+async function getMusic() {
+  if (music) return music;
+  if (!guideUrl) return (music = tune());
+  status('Загружаю музыку…');
+  const response = await fetch(guideUrl);
+  if (!response.ok) throw new Error(`заготовка не скачалась: ${response.status}`);
+  music = await audio().decodeAudioData(await response.arrayBuffer());
+  log('заготовка:', music.duration.toFixed(1), 'с,', music.numberOfChannels, 'кан.');
   return music;
 }
 
-$('file').onchange = async () => {
-  try {
-    music = await audio().decodeAudioData(await $('file').files[0].arrayBuffer());
-    log('свой файл:', music.duration.toFixed(1), 'с,', music.numberOfChannels, 'кан.');
-  } catch (e) { fail(e); }
-};
-
-$('b-music').onclick = () => {
+$('b-music').onclick = async () => {
+  audio();
   stopAll();
-  play(getMusic());
+  try { play(await getMusic()); } catch (e) { fail(e); return; }
+  status('Играет музыка. Запомните, как она звучит.');
   log('музыка', stream ? 'при включённом микрофоне' : 'без микрофона');
 };
 
 async function showMic() {
   if (!stream) return;
-  const track = stream.getAudioTracks()[0], settings = track.getSettings();
-  $('mic').textContent = `Пишет: ${track.label || '?'} · ${settings.sampleRate || '?'} Гц`;
-  log('пишет:', track.label, JSON.stringify(settings));
+  const track = stream.getAudioTracks()[0];
+  $('mic').textContent = `Пишет: ${track.label || '?'}`;
+  log('пишет:', track.label, JSON.stringify(track.getSettings()));
   const devices = await navigator.mediaDevices.enumerateDevices();
   log('устройства:', devices.map(d => `${d.kind}:${d.label || '?'}`).join(' | '));
 }
 
 if (navigator.mediaDevices) {
   navigator.mediaDevices.addEventListener('devicechange', () => { log('devicechange'); showMic(); });
-}
-
-function meter() {
-  const analyser = ctx.createAnalyser(), data = new Float32Array(analyser.fftSize);
-  ctx.createMediaStreamSource(stream).connect(analyser);
-  meterTimer = setInterval(() => {
-    analyser.getFloatTimeDomainData(data);
-    const rms = Math.sqrt(data.reduce((sum, x) => sum + x * x, 0) / data.length);
-    $('meter').firstChild.style.width = `${Math.min(100, rms * 400)}%`;
-  }, 100);
 }
 
 $('b-mic').onclick = async () => {
@@ -153,40 +156,99 @@ $('b-mic').onclick = async () => {
   track.onunmute = () => log('микрофон: unmute');
   track.onended = () => log('микрофон: ended');
   log('микрофон дали');
+
+  // Запись в два канала: левый — голос, правый — музыка ровно так, как она
+  // ушла в наушники. По правому каналу видно, где в записи началась музыка.
+  const mic = ctx.createMediaStreamSource(stream);
+  merger = ctx.createChannelMerger(2);
+  dest = ctx.createMediaStreamDestination();
+  mic.connect(merger, 0, 0);
+  merger.connect(dest);
+
+  const analyser = ctx.createAnalyser(), data = new Float32Array(analyser.fftSize);
+  mic.connect(analyser);
+  meterTimer = setInterval(() => {
+    analyser.getFloatTimeDomainData(data);
+    const rms = Math.sqrt(data.reduce((sum, x) => sum + x * x, 0) / data.length);
+    $('meter').firstChild.style.width = `${Math.min(100, rms * 400)}%`;
+  }, 100);
+
   await showMic();
-  meter();
-  $('b-rec').disabled = $('b-off').disabled = false;
+  $('b-off').disabled = false;
+  $('b-rec').textContent = '⏳ Микрофон прогревается…';
+  status('Микрофон включён, прогревается.');
+  setTimeout(() => {
+    if (!stream) return;
+    $('b-rec').textContent = '3. ⏺ Петь под музыку';
+    $('b-rec').disabled = false;
+    status('Можно петь.');
+  }, WARMUP * 1000);
 };
 
-$('b-rec').onclick = () => {
-  stopAll();
+$('b-rec').onclick = async () => {
   audio();
+  stopAll();
+  let buffer;
+  try { buffer = await getMusic(); } catch (e) { fail(e); return; }
   const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
     .find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
-  rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  rec = new MediaRecorder(dest.stream, type ? { mimeType: type } : undefined);
   const chunks = [];
   rec.ondataavailable = e => chunks.push(e.data);
   rec.onstop = async () => {
-    const blob = new Blob(chunks, { type: rec.mimeType });
-    log('записано:', Math.round(blob.size / 1024), 'КБ', rec.mimeType);
+    clearInterval(countdown);
+    recBlob = new Blob(chunks, { type: rec.mimeType });
+    log('записано:', Math.round(recBlob.size / 1024), 'КБ', rec.mimeType);
     try {
-      recBuf = await audio().decodeAudioData(await blob.arrayBuffer());
-      log('запись:', recBuf.duration.toFixed(1), 'с');
-      $('b-play').disabled = $('b-mix').disabled = false;
+      recBuf = await audio().decodeAudioData(await recBlob.arrayBuffer());
+      voiceBuf = ctx.createBuffer(1, recBuf.length, recBuf.sampleRate);
+      voiceBuf.copyToChannel(recBuf.getChannelData(0), 0);
+      log('запись:', recBuf.duration.toFixed(1), 'с,', recBuf.numberOfChannels, 'кан.');
     } catch (e) { fail(e); }
-    $('b-rec').textContent = '3. ⏺ Петь под музыку';
+    $('b-rec').classList.remove('live');
+    $('b-rec').textContent = '3. ⏺ Спеть ещё раз';
+    $('b-rec').disabled = false;
+    $('b-play').disabled = $('b-mix').disabled = false;
+    $('b-send').disabled = !putUrl;
+    status(putUrl ? 'Готово. Послушайте и отправьте.' : 'Готово. Отправка в этой ссылке не настроена.');
   };
+
   rec.start();
-  const seconds = Math.min(getMusic().duration, 30);
-  play(getMusic());
-  setTimeout(() => rec.state === 'recording' && rec.stop(), seconds * 1000 + 300);
-  $('b-rec').textContent = `⏺ Идёт запись, ${Math.round(seconds)} с…`;
-  log('запись пошла:', seconds.toFixed(1), 'с, outputLatency', ctx.outputLatency);
+  play(buffer, { when: LEAD, toRecord: true });
+  const total = LEAD + buffer.duration + TAIL;
+  const started = performance.now();
+  setTimeout(() => rec.state === 'recording' && rec.stop(), total * 1000);
+  $('b-rec').disabled = true;
+  $('b-rec').classList.add('live');
+  const tick = () => {
+    const left = Math.max(0, Math.ceil(total - (performance.now() - started) / 1000));
+    $('b-rec').textContent = `🔴 Идёт запись — ${left} с`;
+  };
+  tick();
+  const countdown = setInterval(tick, 250);
+  $('b-play').disabled = $('b-mix').disabled = $('b-send').disabled = true;
+  status('Пойте вместе с музыкой.');
+  log('запись пошла:', buffer.duration.toFixed(1), 'с музыки, outputLatency', ctx.outputLatency);
 };
 
-$('b-play').onclick = () => { stopAll(); play(recBuf); log('слушаю запись'); };
+$('b-play').onclick = () => { stopAll(); play(voiceBuf); log('слушаю голос'); };
 
-$('b-mix').onclick = () => { stopAll(); play(recBuf); play(getMusic()); log('слушаю запись с музыкой'); };
+$('b-mix').onclick = () => { stopAll(); play(recBuf); log('слушаю голос с музыкой'); };
+
+$('b-send').onclick = async () => {
+  $('b-send').disabled = true;
+  status('Отправляю…');
+  try {
+    const response = await fetch(putUrl, { method: 'PUT', body: recBlob });
+    if (!response.ok) throw new Error(`хранилище ответило ${response.status}`);
+    log('отправлено:', Math.round(recBlob.size / 1024), 'КБ');
+    status('✅ Отправлено.');
+  } catch (e) {
+    fail(e);
+    status('Не отправилось — пришлите отчёт.');
+    $('b-send').disabled = false;
+  }
+};
 
 $('b-off').onclick = () => {
   stopAll();
@@ -199,6 +261,8 @@ $('b-off').onclick = () => {
   ctx = null;
   $('mic').textContent = 'Микрофон выключен';
   $('b-rec').disabled = $('b-off').disabled = true;
+  $('b-rec').textContent = '3. ⏺ Петь под музыку';
+  status('Микрофон выключен.');
   log('микрофон выключен');
 };
 
