@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Тест микрофона</title>
+<style>
+  body { margin: 0; padding: 16px; font: 16px/1.4 -apple-system, system-ui, sans-serif; background: #f4eee6; color: #221d28; }
+  h3 { margin: 0 0 .5rem; }
+  button { display: block; width: 100%; margin: 8px 0; padding: 14px; font-size: 17px; border: 0; border-radius: 10px; background: #7a3d92; color: #fff; }
+  button:disabled { opacity: .35; }
+  .small { font-size: 13px; color: #6b6474; }
+  #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
+  #meter div { height: 100%; width: 0; background: #3a8f3a; }
+  #log { width: 100%; box-sizing: border-box; height: 260px; font: 12px/1.35 ui-monospace, monospace; border: 0; border-radius: 8px; padding: 8px; }
+</style>
+
+<h3>🎧 Петь под музыку в наушниках</h3>
+<p class="small" id="env"></p>
+
+<button id="b-music">1. ▶️ Музыка без микрофона</button>
+<p class="small">Встроенная мелодия: 4 секунды в левом ухе, 4 в правом. Можно взять свой файл:
+  <input type="file" id="file" accept="audio/*"></p>
+<button id="b-mic">2. 🎤 Включить микрофон</button>
+<p class="small" id="mic">Микрофон выключен</p>
+<div id="meter"><div></div></div>
+<button id="b-rec" disabled>3. ⏺ Петь под музыку</button>
+<button id="b-play" disabled>4. 🎧 Послушать запись</button>
+<button id="b-mix" disabled>5. 🎧 Запись вместе с музыкой</button>
+<button id="b-off" disabled>6. 🔇 Выключить микрофон</button>
+<button id="b-copy">📋 Скопировать отчёт</button>
+<textarea id="log" readonly></textarea>
+
+<script>
+const $ = id => document.getElementById(id);
+const t0 = performance.now();
+const log = (...parts) => {
+  $('log').value += `${((performance.now() - t0) / 1000).toFixed(1)}s ${parts.join(' ')}\n`;
+  $('log').scrollTop = 1e9;
+};
+const fail = e => log('ОШИБКА', e && e.name, e && e.message || e);
+window.onerror = message => log('ОШИБКА', message);
+window.onunhandledrejection = e => fail(e.reason);
+
+// Telegram передаёт параметры запуска Mini App в хеше адреса.
+const launch = new URLSearchParams(location.hash.slice(1));
+const where = launch.get('tgWebAppPlatform')
+  ? `Mini App (${launch.get('tgWebAppPlatform')}, ${launch.get('tgWebAppVersion')})`
+  : 'браузер';
+$('env').textContent = `Открыто: ${where}`;
+log('открыто:', where);
+log('ua:', navigator.userAgent);
+log('mediaDevices:', !!navigator.mediaDevices, 'MediaRecorder:', typeof MediaRecorder);
+
+let ctx, music, stream, rec, recBuf, meterTimer;
+let sources = [];
+
+function audio() {
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx.onstatechange = () => log('звук:', ctx && ctx.state);
+    log('звук: частота', ctx.sampleRate, 'baseLatency', ctx.baseLatency, 'outputLatency', ctx.outputLatency);
+  }
+  ctx.resume();
+  return ctx;
+}
+
+function stopAll() {
+  sources.forEach(s => { try { s.stop(); } catch { /* уже остановлен */ } });
+  sources = [];
+}
+
+function play(buffer) {
+  const src = audio().createBufferSource();
+  src.buffer = buffer;
+  src.connect(ctx.destination);
+  src.start();
+  sources.push(src);
+  return src;
+}
+
+// Мелодия из восьми нот по кругу: первая фраза в левом канале, вторая в правом.
+// В режиме звонка наушники становятся моно, и обе фразы слышны в обоих ушах.
+function tune() {
+  const c = audio(), rate = c.sampleRate, note = Math.round(rate / 2), steps = [0, 2, 4, 5, 7, 5, 4, 2];
+  const buffer = c.createBuffer(2, note * 40, rate);
+  for (let i = 0; i < 40; i++) {
+    const f = 220 * 2 ** (steps[i % 8] / 12);
+    const channel = buffer.getChannelData(Math.floor(i / 8) % 2);
+    for (let n = 0; n < note; n++) {
+      const s = n / rate, env = Math.min(1, s * 50) * Math.exp(-s * 3);
+      channel[i * note + n] = 0.3 * env * (Math.sin(2 * Math.PI * f * s) + 0.5 * Math.sin(4 * Math.PI * f * s) + 0.25 * Math.sin(6 * Math.PI * f * s));
+    }
+  }
+  return buffer;
+}
+
+function getMusic() {
+  if (!music) music = tune();
+  return music;
+}
+
+$('file').onchange = async () => {
+  try {
+    music = await audio().decodeAudioData(await $('file').files[0].arrayBuffer());
+    log('свой файл:', music.duration.toFixed(1), 'с,', music.numberOfChannels, 'кан.');
+  } catch (e) { fail(e); }
+};
+
+$('b-music').onclick = () => {
+  stopAll();
+  play(getMusic());
+  log('музыка', stream ? 'при включённом микрофоне' : 'без микрофона');
+};
+
+async function showMic() {
+  if (!stream) return;
+  const track = stream.getAudioTracks()[0], settings = track.getSettings();
+  $('mic').textContent = `Пишет: ${track.label || '?'} · ${settings.sampleRate || '?'} Гц`;
+  log('пишет:', track.label, JSON.stringify(settings));
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  log('устройства:', devices.map(d => `${d.kind}:${d.label || '?'}`).join(' | '));
+}
+
+if (navigator.mediaDevices) {
+  navigator.mediaDevices.addEventListener('devicechange', () => { log('devicechange'); showMic(); });
+}
+
+function meter() {
+  const analyser = ctx.createAnalyser(), data = new Float32Array(analyser.fftSize);
+  ctx.createMediaStreamSource(stream).connect(analyser);
+  meterTimer = setInterval(() => {
+    analyser.getFloatTimeDomainData(data);
+    const rms = Math.sqrt(data.reduce((sum, x) => sum + x * x, 0) / data.length);
+    $('meter').firstChild.style.width = `${Math.min(100, rms * 400)}%`;
+  }, 100);
+}
+
+$('b-mic').onclick = async () => {
+  audio();
+  try {
+    // Шумоподавление и автогромкость портят пение и, по отчётам WebKit,
+    // уводят звук из наушников в динамик.
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (e) {
+    log('микрофон НЕ дали:');
+    fail(e);
+    return;
+  }
+  const track = stream.getAudioTracks()[0];
+  track.onmute = () => log('микрофон: mute');
+  track.onunmute = () => log('микрофон: unmute');
+  track.onended = () => log('микрофон: ended');
+  log('микрофон дали');
+  await showMic();
+  meter();
+  $('b-rec').disabled = $('b-off').disabled = false;
+};
+
+$('b-rec').onclick = () => {
+  stopAll();
+  audio();
+  const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+    .find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+  rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  const chunks = [];
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.onstop = async () => {
+    const blob = new Blob(chunks, { type: rec.mimeType });
+    log('записано:', Math.round(blob.size / 1024), 'КБ', rec.mimeType);
+    try {
+      recBuf = await audio().decodeAudioData(await blob.arrayBuffer());
+      log('запись:', recBuf.duration.toFixed(1), 'с');
+      $('b-play').disabled = $('b-mix').disabled = false;
+    } catch (e) { fail(e); }
+    $('b-rec').textContent = '3. ⏺ Петь под музыку';
+  };
+  rec.start();
+  const seconds = Math.min(getMusic().duration, 30);
+  play(getMusic());
+  setTimeout(() => rec.state === 'recording' && rec.stop(), seconds * 1000 + 300);
+  $('b-rec').textContent = `⏺ Идёт запись, ${Math.round(seconds)} с…`;
+  log('запись пошла:', seconds.toFixed(1), 'с, outputLatency', ctx.outputLatency);
+};
+
+$('b-play').onclick = () => { stopAll(); play(recBuf); log('слушаю запись'); };
+
+$('b-mix').onclick = () => { stopAll(); play(recBuf); play(getMusic()); log('слушаю запись с музыкой'); };
+
+$('b-off').onclick = () => {
+  stopAll();
+  stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  clearInterval(meterTimer);
+  $('meter').firstChild.style.width = 0;
+  // Новый AudioContext — чтобы iOS могла вернуть наушники из режима звонка.
+  ctx.close();
+  ctx = null;
+  $('mic').textContent = 'Микрофон выключен';
+  $('b-rec').disabled = $('b-off').disabled = true;
+  log('микрофон выключен');
+};
+
+$('b-copy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($('log').value);
+    log('отчёт скопирован');
+  } catch {
+    $('log').select();
+    log('скопировать не дали — текст выделен, скопируйте вручную или пришлите скриншот');
+  }
+};
+</script>
