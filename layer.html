@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Слоёная песня</title>
+<style>
+  body { margin: 0; padding: 16px; font: 16px/1.4 -apple-system, system-ui, sans-serif; background: #f4eee6; color: #221d28; }
+  h3 { margin: 0 0 .5rem; }
+  button { display: block; width: 100%; margin: 8px 0; padding: 14px; font-size: 17px; border: 0; border-radius: 10px; background: #7a3d92; color: #fff; }
+  button:disabled { opacity: .35; }
+  button.live { background: #c0392b; opacity: 1; }
+  select, input { width: 100%; box-sizing: border-box; margin: 8px 0; padding: 12px; font-size: 16px; border-radius: 10px; border: 1px solid #c9bfd2; background: #fff; }
+  .hint { font-size: 14px; color: #6b6474; margin: 4px 0 12px; }
+  #status { font-weight: 600; margin: 12px 0; }
+  #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
+  #meter div { height: 100%; width: 0; background: #3a8f3a; }
+  .parts { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  .parts button { display: inline-block; width: auto; margin: 0; padding: 10px 14px; font-size: 15px; background: #e6dcef; color: #221d28; }
+  .parts button.on { background: #7a3d92; color: #fff; }
+  .hidden { display: none; }
+</style>
+
+<h3 id="title"></h3>
+<p class="hint" id="hint"></p>
+
+<button id="b-mic">🎤 Включить микрофон</button>
+<select id="mic-pick" class="hidden"></select>
+<div id="meter"><div></div></div>
+<button id="b-rec" disabled>⏺ Петь</button>
+<button id="b-play" disabled>🎧 Послушать голос</button>
+
+<div id="part-box" class="hidden">
+  <p><b>Какой голос ты пел?</b></p>
+  <div class="parts" id="parts"></div>
+  <input id="part-own" placeholder="или своими словами" maxlength="40">
+</div>
+
+<button id="b-send" disabled>📤 Отправить</button>
+<p id="status"></p>
+
+<script>
+// Страница «Слоёной песни». Бот кладёт в адрес подписанные ссылки: `guide` —
+// скачать фонограмму, `put` и `meta` — загрузить запись и отметку. Запись
+// идёт прямо в хранилище, сервер в ней не участвует. Подробности —
+// docs/layer_song.md в folk_base.
+const $ = id => document.getElementById(id);
+const query = new URLSearchParams(location.search);
+const launch = new URLSearchParams(location.hash.slice(1));
+const claps = query.get('mode') === 'claps';
+const logLines = [];
+const log = (...parts) => { logLines.push(parts.join(' ')); if (logLines.length > 60) logLines.shift(); };
+const status = text => { $('status').textContent = text; };
+window.onerror = message => log('ошибка', message);
+
+const WARMUP = 3;   // секунд прогрева: без него начало звучит «из ведра»
+const LEAD = 1;     // секунд записи до фонограммы: по ней бот меряет шум
+const TAIL = 1.5;   // секунд записи после фонограммы
+const PARTS = ['основной', 'подголосок', 'верх (дишкант)', 'низ', 'около серединки', 'не знаю'];
+// Шумоподавление и автогромкость портят пение.
+const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+
+let ctx, music, stream, merger, dest, recBlob, meterTimer, wakeLock, part = null;
+let sources = [];
+
+$('title').textContent = claps ? '🎯 Проверка наушников' : `🥐 ${query.get('title') || 'Слоёная песня'}`;
+$('hint').textContent = claps
+  ? 'Наденьте наушники. Зазвучит мелодия на 20 секунд — хлопайте точно в начало каждой ноты.'
+  : 'Наденьте наушники и пойте песню целиком под фонограмму. Не блокируйте экран, пока идёт запись.';
+log('открыто:', launch.get('tgWebAppPlatform') || 'браузер', navigator.userAgent);
+
+function audio() {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume();
+  return ctx;
+}
+
+function stopAll() {
+  sources.forEach(s => { try { s.stop ? s.stop() : s.pause(); } catch { /* уже остановлен */ } });
+  sources = [];
+}
+
+// Мелодия проверки: 40 нот по 0.5 с.
+function tune() {
+  const c = audio(), rate = c.sampleRate, note = Math.round(rate / 2), steps = [0, 2, 4, 5, 7, 5, 4, 2];
+  const buffer = c.createBuffer(1, note * 40, rate);
+  const channel = buffer.getChannelData(0);
+  for (let i = 0; i < 40; i++) {
+    const f = 220 * 2 ** (steps[i % 8] / 12);
+    for (let n = 0; n < note; n++) {
+      const s = n / rate, env = Math.min(1, s * 50) * Math.exp(-s * 3);
+      channel[i * note + n] = 0.3 * env * (Math.sin(2 * Math.PI * f * s) + 0.5 * Math.sin(4 * Math.PI * f * s));
+    }
+  }
+  return buffer;
+}
+
+async function getMusic() {
+  if (music) return music;
+  if (claps) return (music = tune());
+  status('Загружаю фонограмму…');
+  const response = await fetch(query.get('guide'));
+  if (!response.ok) throw new Error(`фонограмма не скачалась: ${response.status}`);
+  music = await audio().decodeAudioData(await response.arrayBuffer());
+  status('');
+  log('фонограмма', music.duration.toFixed(1), 'с');
+  return music;
+}
+
+// Название микрофона — ключ, под которым бот помнит задержку. Приставки
+// Windows «По умолчанию — …» и «Связь — …» у одного микрофона разные.
+const micName = label => (label || '').replace(/^(по умолчанию|default|связь|communications)\s*-\s*/i, '').trim();
+
+function closeMic() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  clearInterval(meterTimer);
+  $('meter').firstChild.style.width = 0;
+  $('b-rec').disabled = true;
+}
+
+async function openMic(deviceId) {
+  audio();
+  closeMic();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: deviceId ? { ...RAW, deviceId: { exact: deviceId } } : RAW });
+  } catch (e) {
+    log('микрофон не дали', e.name, e.message);
+    status('Нет доступа к микрофону. Разрешите его и откройте страницу заново.');
+    return;
+  }
+  // Запись в два канала: левый — голос, правый — фонограмма ровно так, как
+  // она ушла в наушники. По правому каналу бот находит, где начать.
+  const mic = ctx.createMediaStreamSource(stream);
+  merger = ctx.createChannelMerger(2);
+  dest = ctx.createMediaStreamDestination();
+  mic.connect(merger, 0, 0);
+  merger.connect(dest);
+  const analyser = ctx.createAnalyser(), data = new Float32Array(analyser.fftSize);
+  mic.connect(analyser);
+  meterTimer = setInterval(() => {
+    analyser.getFloatTimeDomainData(data);
+    const rms = Math.sqrt(data.reduce((sum, x) => sum + x * x, 0) / data.length);
+    $('meter').firstChild.style.width = `${Math.min(100, rms * 400)}%`;
+  }, 100);
+
+  const track = stream.getAudioTracks()[0], current = track.getSettings().deviceId;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const pick = $('mic-pick');
+  pick.innerHTML = '';
+  devices.filter(d => d.kind === 'audioinput').forEach(d =>
+    pick.add(new Option(`🎤 ${d.label || 'микрофон'}`, d.deviceId, false, d.deviceId === current)));
+  pick.classList.remove('hidden');
+  log('микрофон:', track.label);
+
+  $('b-mic').textContent = '🎤 Микрофон включён';
+  $('b-rec').textContent = '⏳ Микрофон прогревается…';
+  const warming = stream;
+  setTimeout(() => {
+    if (stream !== warming) return;
+    $('b-rec').textContent = recBlob ? '⏺ Спеть заново' : '⏺ Петь';
+    $('b-rec').disabled = false;
+  }, WARMUP * 1000);
+}
+
+$('b-mic').onclick = () => openMic($('mic-pick').value);
+$('mic-pick').onchange = () => stream && openMic($('mic-pick').value);
+
+let rec = null, stopTimer, countdown;
+
+function finishRecording(keep) {
+  clearTimeout(stopTimer);
+  clearInterval(countdown);
+  stopAll();
+  if (wakeLock) wakeLock.release().catch(() => {});
+  rec.keep = keep;
+  if (rec.state === 'recording') rec.stop();
+}
+
+$('b-rec').onclick = async () => {
+  if (rec && rec.state === 'recording') { finishRecording(false); return; }
+  let buffer;
+  try { buffer = await getMusic(); } catch (e) { log(e.message); status('Фонограмма не загрузилась. Откройте страницу заново.'); return; }
+  const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+    .find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+  rec = new MediaRecorder(dest.stream, type ? { mimeType: type } : undefined);
+  const chunks = [];
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.onstop = () => {
+    $('b-rec').classList.remove('live');
+    $('b-rec').textContent = recBlob ? '⏺ Спеть заново' : '⏺ Петь';
+    $('b-rec').disabled = false;
+    if (!rec.keep) { status('Запись прервана.'); return; }
+    recBlob = new Blob(chunks, { type: rec.mimeType });
+    log('записано', Math.round(recBlob.size / 1024), 'КБ', rec.mimeType);
+    $('b-rec').textContent = '⏺ Спеть заново';
+    $('b-play').disabled = false;
+    if (!claps) $('part-box').classList.remove('hidden');
+    updateSend();
+    status(claps ? 'Готово. Отправьте.' : 'Готово. Послушайте, выберите голос и отправьте.');
+  };
+
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* не везде есть */ }
+  rec.start(1000);
+  const src = audio().createBufferSource();
+  src.buffer = buffer;
+  src.connect(ctx.destination);
+  src.connect(merger, 0, 1);
+  src.start(ctx.currentTime + LEAD);
+  sources.push(src);
+  const total = LEAD + buffer.duration + TAIL, started = performance.now();
+  stopTimer = setTimeout(() => finishRecording(true), total * 1000);
+  $('b-rec').classList.add('live');
+  $('b-play').disabled = $('b-send').disabled = true;
+  const tick = () => {
+    const left = Math.max(0, Math.ceil(total - (performance.now() - started) / 1000));
+    $('b-rec').textContent = `🔴 Идёт запись — ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} · прервать`;
+  };
+  tick();
+  countdown = setInterval(tick, 250);
+  status(claps ? 'Хлопайте в начало каждой ноты.' : 'Пойте вместе с фонограммой.');
+  log('запись пошла, outputLatency', ctx.outputLatency);
+};
+
+// Только голос, в оба уха: левый канал записи. Фонограмма в записи идёт
+// раньше голоса на задержку наушников, поэтому вместе их здесь не играем —
+// как слой лёг на неё, бот пришлёт сам.
+$('b-play').onclick = () => {
+  stopAll();
+  const player = new Audio(URL.createObjectURL(recBlob));
+  const split = audio().createChannelSplitter(2);
+  ctx.createMediaElementSource(player).connect(split);
+  split.connect(ctx.destination, 0);
+  player.play();
+  sources.push(player);
+};
+
+PARTS.forEach(name => {
+  const button = document.createElement('button');
+  button.textContent = name;
+  button.onclick = () => {
+    part = name;
+    $('part-own').value = '';
+    document.querySelectorAll('.parts button').forEach(b => b.classList.toggle('on', b === button));
+    updateSend();
+  };
+  $('parts').append(button);
+});
+$('part-own').oninput = () => {
+  part = $('part-own').value.trim() || null;
+  document.querySelectorAll('.parts button').forEach(b => b.classList.remove('on'));
+  updateSend();
+};
+
+function updateSend() {
+  $('b-send').disabled = !recBlob || (!claps && !part);
+}
+
+$('b-send').onclick = async () => {
+  $('b-send').disabled = true;
+  status('Отправляю…');
+  const track = stream && stream.getAudioTracks()[0];
+  const meta = {
+    mode: claps ? 'claps' : 'song',
+    part,
+    mic: micName(track && track.label),
+    platform: launch.get('tgWebAppPlatform') || 'browser',
+    mime: recBlob.type,
+    log: logLines,
+  };
+  try {
+    // Сначала запись, потом отметка: бот берёт запись, только когда видит отметку.
+    for (const [url, body] of [[query.get('put'), recBlob], [query.get('meta'), JSON.stringify(meta)]]) {
+      const response = await fetch(url, { method: 'PUT', body });
+      if (!response.ok) throw new Error(`хранилище ответило ${response.status}`);
+    }
+    // Ключи в ссылках одноразовые: бот уже мог забрать эту запись, и
+    // повторная отправка по ним потерялась бы. Перепеть — новой страницей.
+    $('b-rec').disabled = true;
+    $('b-mic').disabled = true;
+    status('✅ Отправлено. Бот проверит запись и напишет в личку. Страницу можно закрыть, а чтобы перепеть — открыть заново из бота.');
+  } catch (e) {
+    log('не отправилось', e.message);
+    status('Не отправилось. Проверьте интернет и нажмите ещё раз.');
+    $('b-send').disabled = false;
+  }
+};
+</script>
