@@ -14,9 +14,6 @@
   #status { font-weight: 600; margin: 12px 0; }
   #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
   #meter div { height: 100%; width: 0; background: #3a8f3a; }
-  .parts { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
-  .parts button { display: inline-block; width: auto; margin: 0; padding: 10px 14px; font-size: 15px; background: #e6dcef; color: #221d28; }
-  .parts button.on { background: #7a3d92; color: #fff; }
   .hidden { display: none; }
 </style>
 
@@ -26,13 +23,13 @@
 <button id="b-mic">🎤 Включить микрофон</button>
 <select id="mic-pick" class="hidden"></select>
 <div id="meter"><div></div></div>
-<button id="b-rec" disabled>⏺ Петь</button>
+<button id="b-rec" disabled></button>
 <button id="b-play" disabled>🎧 Послушать голос</button>
 
 <div id="part-box" class="hidden">
   <p><b>Какой голос ты пел?</b></p>
-  <div class="parts" id="parts"></div>
-  <input id="part-own" placeholder="или своими словами" maxlength="40">
+  <p class="hint">Своими словами. Например: «основной» или «дишкант».</p>
+  <input id="part-own" maxlength="40">
 </div>
 
 <button id="b-send" disabled>📤 Отправить</button>
@@ -55,14 +52,17 @@ window.onerror = message => log('ошибка', message);
 const WARMUP = 3;   // секунд прогрева: без него начало звучит «из ведра»
 const LEAD = 1;     // секунд записи до фонограммы: по ней бот меряет шум
 const TAIL = 1.5;   // секунд записи после фонограммы
-const PARTS = ['основной', 'подголосок', 'верх (дишкант)', 'низ', 'около серединки', 'не знаю'];
 // Шумоподавление и автогромкость портят пение.
 const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 
 let ctx, music, stream, merger, dest, recBlob, meterTimer, wakeLock, part = null;
 let sources = [];
 
-$('title').textContent = claps ? '🎯 Проверка наушников' : `🥐 ${query.get('title') || 'Слоёная песня'}`;
+$('title').textContent = claps ? 'Проверка звука' : `🥐 ${query.get('title') || 'Слоёная песня'}`;
+const START = claps ? '⏺ Начать' : '⏺ Петь';
+const AGAIN = claps ? '⏺ Ещё раз' : '⏺ Спеть заново';
+$('b-rec').textContent = START;
+if (claps) $('b-play').classList.add('hidden');
 $('hint').textContent = claps
   ? 'Наденьте наушники. Зазвучит мелодия на 20 секунд — хлопайте точно в начало каждой ноты.'
   : 'Наденьте наушники и пойте песню целиком под фонограмму. Не блокируйте экран, пока идёт запись.';
@@ -157,7 +157,7 @@ async function openMic(deviceId) {
   const warming = stream;
   setTimeout(() => {
     if (stream !== warming) return;
-    $('b-rec').textContent = recBlob ? '⏺ Спеть заново' : '⏺ Петь';
+    $('b-rec').textContent = recBlob ? AGAIN : START;
     $('b-rec').disabled = false;
   }, WARMUP * 1000);
 }
@@ -187,12 +187,12 @@ $('b-rec').onclick = async () => {
   rec.ondataavailable = e => chunks.push(e.data);
   rec.onstop = () => {
     $('b-rec').classList.remove('live');
-    $('b-rec').textContent = recBlob ? '⏺ Спеть заново' : '⏺ Петь';
+    $('b-rec').textContent = recBlob ? AGAIN : START;
     $('b-rec').disabled = false;
     if (!rec.keep) { status('Запись прервана.'); return; }
     recBlob = new Blob(chunks, { type: rec.mimeType });
     log('записано', Math.round(recBlob.size / 1024), 'КБ', rec.mimeType);
-    $('b-rec').textContent = '⏺ Спеть заново';
+    $('b-rec').textContent = AGAIN;
     $('b-play').disabled = false;
     if (!claps) $('part-box').classList.remove('hidden');
     updateSend();
@@ -234,20 +234,8 @@ $('b-play').onclick = () => {
   sources.push(player);
 };
 
-PARTS.forEach(name => {
-  const button = document.createElement('button');
-  button.textContent = name;
-  button.onclick = () => {
-    part = name;
-    $('part-own').value = '';
-    document.querySelectorAll('.parts button').forEach(b => b.classList.toggle('on', b === button));
-    updateSend();
-  };
-  $('parts').append(button);
-});
 $('part-own').oninput = () => {
   part = $('part-own').value.trim() || null;
-  document.querySelectorAll('.parts button').forEach(b => b.classList.remove('on'));
   updateSend();
 };
 
