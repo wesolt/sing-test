@@ -18,6 +18,7 @@
   #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
   #meter div { height: 100%; width: 0; background: #3a8f3a; }
   .hidden { display: none; }
+  #lyrics { white-space: pre-wrap; font-size: 17px; line-height: 1.5; background: #fff; border-radius: 10px; padding: 12px; margin: 8px 0; }
 </style>
 
 <h3 id="title"></h3>
@@ -35,6 +36,7 @@
 <h4>2. Песня</h4>
 <p class="hint">Пой песню целиком под фонограмму. Не блокируй экран, пока идёт запись.</p>
 <button id="b-rec" disabled>⏺ Петь</button>
+<div id="lyrics" class="hidden"></div>
 
 <div id="listen-box" class="hidden">
   <h4>3. Послушай</h4>
@@ -91,6 +93,14 @@ let sources = [], tune = null, claps = null, recBlob = null, take = null, listen
 
 $('title').textContent = `🥐 ${query.get('title') || 'Слоёная песня'}`;
 log('открыто:', launch.get('tgWebAppPlatform') || 'браузер', navigator.userAgent);
+
+// Текст песни прислал запускающий: под сопровождение слов в фонограмме нет.
+if (query.get('lyrics')) {
+  fetch(query.get('lyrics'))
+    .then(response => (response.ok ? response.text() : Promise.reject(new Error(response.status))))
+    .then(text => { $('lyrics').textContent = text; $('lyrics').classList.remove('hidden'); })
+    .catch(e => log('текст песни не скачался', e.message));
+}
 
 // Старая ссылка «Проверить звук»: хлопки теперь часть записи.
 if (query.get('mode') === 'claps') {
