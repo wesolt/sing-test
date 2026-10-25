@@ -18,6 +18,9 @@
   #meter { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 4px 0 12px; }
   #meter div { height: 100%; width: 0; background: #3a8f3a; }
   .hidden { display: none; }
+  .alert { padding: 12px; border-radius: 10px; font-weight: 600; margin: 8px 0; }
+  .alert.bad { background: #fbd9d5; color: #7d1a10; }
+  .alert.warn { background: #fdeec2; color: #5e4300; }
   #lyrics { white-space: pre-wrap; font-size: 17px; line-height: 1.5; background: #fff; border-radius: 10px; padding: 12px; margin: 8px 0; }
 </style>
 
@@ -32,14 +35,22 @@
 <h4>1. Хлопки</h4>
 <p class="hint">15 секунд. Хлопай громко в каждый удар — там нота громче всего и сменяется.</p>
 <button id="b-claps" disabled>👏 Хлопать</button>
+<p id="claps-check" class="alert bad hidden"></p>
 
 <h4>2. Песня</h4>
 <p class="hint">Пой песню целиком под фонограмму. Не блокируй экран, пока идёт запись.</p>
 <button id="b-rec" disabled>⏺ Петь</button>
 <div id="lyrics" class="hidden"></div>
 
+<div id="voice-box" class="hidden">
+  <h4>3. Твой слой</h4>
+  <button id="b-voice">▶ Послушать свой слой</button>
+  <p class="hint">Так твой слой ляжет в хор. Послушай, записался ли он чисто, без лишних шумов и звучания фонограммы.</p>
+  <p id="check" class="hidden"></p>
+</div>
+
 <div id="listen-box" class="hidden">
-  <h4>3. Послушай</h4>
+  <h4>4. Послушай</h4>
   <p class="hint">Слушай в наушниках: голос должен чётко попадать в фонограмму. Отстаёт или спешит — подвинь.</p>
   <button id="b-listen">▶ Слушать</button>
   <div class="row">
@@ -89,6 +100,20 @@ const SINGING_AFTER_CLAPS = 0.02;
 const STEP = 0.01;        // шаг сдвига: 20 мс Дмитрию грубо — ровное место попадало между шагами
 const MIN_LISTEN = 20;    // секунд прослушивания до отправки
 const PREROLL = 2;        // слушать с этого раньше, чем человек запел
+// Тексты проверки записи — Дмитрия, 26.10.2026.
+const TEXTS = {
+  clapsLeak: 'В микрофон попадает мелодия. Если из наушников — убавь в них громкость или надень другие. ' +
+    'Если дело в телефоне или компьютере — проверь настройки звука или выбери другой микрофон. Потом похлопай заново.',
+  refused: 'В запись попало звучание фонограммы. Если из наушников — убавь в них громкость или надень другие. ' +
+    'Если дело в телефоне или компьютере — проверь настройки звука или выбери другой микрофон. ' +
+    'Этот слой в хор не пойдёт — нужно перепеть.',
+  noise: 'В записи слышен шум. Он попадёт в хор вместе с голосом. Послушай свой слой. ' +
+    'Если считаешь нужным, устрани причину и перепой.',
+  leak: 'Послушай свой слой: в нём возможно есть шум или/и фонограмма. Если есть шум — он попадёт в хор вместе ' +
+    'с голосом. Если считаешь нужным — устрани причину и перепой. Если хоть немного слышно фонограмму — не ' +
+    'отправляй слой, он испортит итоговую запись всего хора. Если фонограмма попадает в микрофон из наушников — ' +
+    'то убавь в них громкость или замени наушники. Если проблема в устройстве — разберись с настройками или выбери другое.',
+};
 // Шумоподавление и автогромкость портят пение.
 const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 
@@ -183,7 +208,9 @@ function updateButtons() {
   const busy = id => recording && !$(id).classList.contains('live');
   $('b-claps').disabled = !ready || busy('b-claps');
   $('b-rec').disabled = !ready || !claps || busy('b-rec');
-  $('b-send').disabled = recording || !recBlob || !part || listened < MIN_LISTEN;
+  // Пока запись проверяется или в ней фонограмма, отправить нельзя.
+  $('b-send').disabled = recording || !recBlob || !part || listened < MIN_LISTEN ||
+    !take.check || take.check.verdict === 'refused';
   const left = Math.ceil(MIN_LISTEN - listened);
   $('listen-left').textContent = take && left > 0 ? `Послушай ещё ${left} с — потом можно отправить.` : '';
 }
@@ -313,6 +340,7 @@ $('b-claps').onclick = () => {
   const current = tune || newTune();
   tune = null;
   status('Хлопай в каждый удар.');
+  $('claps-check').classList.add('hidden');
   record($('b-claps'), current.buffer, 1, 'хлопки', async blob => {
     status('Разбираю хлопки…');
     const take = await decode(blob), rate = take.sampleRate;
@@ -320,6 +348,15 @@ $('b-claps').onclick = () => {
     const result = Sound.clapsLatency(take.getChannelData(0), rate, start, current.beats);
     log('хлопки', JSON.stringify(result));
     tune = newTune();
+    // Мелодия из наушников в микрофоне — петь нельзя, сколько ни хлопай.
+    const leak = Sound.clapsLeak(take.getChannelData(0), take.getChannelData(1), rate, result.ok ? result.seconds : null);
+    log('хлопки подмес', JSON.stringify(leak));
+    if (leak.refused) {
+      status('');
+      $('claps-check').textContent = TEXTS.clapsLeak;
+      $('claps-check').classList.remove('hidden');
+      return;
+    }
     if (!result.ok) {
       status('Не разобрал хлопки. Хлопай громко и точно в каждый удар, в наушниках — и ещё раз.');
       return;
@@ -337,6 +374,7 @@ $('b-rec').onclick = async () => {
   status('Пой вместе с фонограммой.');
   take = recBlob = null;
   listened = 0;
+  $('voice-box').classList.add('hidden');
   $('listen-box').classList.add('hidden');
   record($('b-rec'), buffer, TAIL, 'песня', async blob => {
     status('Готовлю прослушивание…');
@@ -361,12 +399,30 @@ $('b-rec').onclick = async () => {
     recBlob = blob;
     $('b-rec').textContent = '⏺ Спеть заново';
     showShift();
+    $('voice-box').classList.remove('hidden');
     $('listen-box').classList.remove('hidden');
     $('part-box').classList.remove('hidden');
     status('Послушай, как лёг голос, напиши, какой голос пел, и отправь.');
+    showCheck();
     updateButtons();
+    // Проверка на подмес и шум — несколько секунд: страница показывается
+    // сразу, человек тем временем слушает.
+    const checking = take;
+    setTimeout(() => {
+      if (take !== checking) return;
+      take.check = Sound.checkTake(full.getChannelData(0), full.getChannelData(1), rate, start, shift);
+      log('проверка', JSON.stringify(take.check));
+      showCheck();
+      updateButtons();
+    }, 50);
   });
 };
+
+function showCheck() {
+  const box = $('check'), verdict = take.check && take.check.verdict;
+  box.className = verdict ? `alert ${verdict === 'refused' ? 'bad' : 'warn'}` : take.check ? 'hidden' : 'hint';
+  box.textContent = verdict ? TEXTS[verdict] : 'Проверяю запись…';
+}
 
 let listenTimer = null, playing = null;
 
@@ -375,27 +431,37 @@ function stopListening() {
   clearInterval(listenTimer);
   stopAll();
   $('b-listen').textContent = '▶ Слушать';
+  $('b-voice').textContent = '▶ Послушать свой слой';
 }
 
-function listen() {
+// С фонограммой — проверить попадание; без неё — чисто ли записался голос.
+// До отправки считается только прослушивание с фонограммой.
+function listen(withGuide) {
   stopListening();
   const c = audio(), at = c.currentTime + 0.05, token = {};
-  const guide = c.createBufferSource(), guideGain = c.createGain();
-  guide.buffer = music;
-  guideGain.gain.value = 0.5;
-  guide.connect(guideGain).connect(c.destination);
-  guide.start(at, take.from);
   const voice = c.createBufferSource(), voiceGain = c.createGain();
   voice.buffer = take.voice;
   voiceGain.gain.value = take.gain;
   voice.connect(voiceGain).connect(c.destination);
   const offset = take.start + take.shift + take.from;
   if (offset >= 0) voice.start(at, offset); else voice.start(at - offset, 0);
-  sources.push(guide, voice);
+  sources.push(voice);
   playing = token;
-  guide.onended = () => { if (playing === token) stopListening(); };
-  listenTimer = setInterval(() => { listened += 0.25; updateButtons(); }, 250);
-  $('b-listen').textContent = '⏹ Стоп';
+  const ended = () => { if (playing === token) stopListening(); };
+  if (withGuide) {
+    const guide = c.createBufferSource(), guideGain = c.createGain();
+    guide.buffer = music;
+    guideGain.gain.value = 0.5;
+    guide.connect(guideGain).connect(c.destination);
+    guide.start(at, take.from);
+    sources.push(guide);
+    guide.onended = ended;
+    listenTimer = setInterval(() => { listened += 0.25; updateButtons(); }, 250);
+    $('b-listen').textContent = '⏹ Стоп';
+  } else {
+    voice.onended = ended;
+    $('b-voice').textContent = '⏹ Стоп';
+  }
 }
 
 function showShift() {
@@ -409,10 +475,11 @@ function showShift() {
 function move(delta) {
   take.shift = Math.round((take.shift + delta) * 1000) / 1000;
   showShift();
-  listen();
+  listen(true);
 }
 
-$('b-listen').onclick = () => (playing ? stopListening() : listen());
+$('b-listen').onclick = () => (playing ? stopListening() : listen(true));
+$('b-voice').onclick = () => (playing ? stopListening() : listen(false));
 $('b-earlier').onclick = () => move(STEP);
 $('b-later').onclick = () => move(-STEP);
 
@@ -436,6 +503,7 @@ $('b-send').onclick = async () => {
     listened: Math.round(listened),
     platform: launch.get('tgWebAppPlatform') || 'browser',
     mime: recBlob.type,
+    check: take.check,
     log: logLines,
   };
   try {

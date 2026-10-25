@@ -68,6 +68,40 @@ for (const rate of [48000, 44100]) {
   }
   assert.ok(Math.abs(Sound.singingStart(voice, rate, 0) - 3) < 0.11);
   assert.ok(Math.abs(Sound.singingStart(voice, rate, rate) - 2) < 0.11);
+
+  // Подмес: фонограмма — мелодии хлопков подряд, голос — своя нота с паузами,
+  // в левый канал попадает фонограмма с задержкой наушников.
+  const tunes = [0, 3, 5].map(index => Sound.clapsTune(rate, index, random).samples);
+  const guide = new Float32Array(tunes.reduce((n, t) => n + t.length, 0));
+  tunes.reduce((at, t) => { guide.set(t, at); return at + t.length; }, 0);
+  const song = (gain, delay = 0.2) => {
+    const lead = rate, length = lead + guide.length + rate;
+    const right = new Float32Array(length), left = new Float32Array(length);
+    right.set(guide.map(x => 0.5 * x), lead);
+    for (let i = lead; i < length - rate; i++) {
+      if (Math.floor(i / rate) % 3) left[i] = 0.2 * Math.sin(2 * Math.PI * 247 * i / rate);
+      left[i] += 0.00003 * noise();
+    }
+    const at = Math.round(delay * rate);
+    for (let i = 0; i + at < length; i++) left[i + at] += gain * right[i];
+    return { left, right };
+  };
+  const power = x => x.reduce((s, v) => s + v * v, 0);
+  for (const gain of [0.01, 0.003, 0.0003]) {
+    const { left, right } = song(gain);
+    const expected = 10 * Math.log10(power(right.map(x => gain * x)) / power(left));
+    const result = Sound.checkTake(left, right, rate, 1, 0.25);
+    assert.ok(Math.abs(result.leakDb - expected) < 1.5, `${rate}: подмес ${result.leakDb.toFixed(1)} вместо ${expected.toFixed(1)}`);
+    assert.ok(Math.abs(result.lag - 0.2) < 0.002 && result.steady, `${rate}: задержка ${result.lag}`);
+    assert.strictEqual(result.verdict, expected >= -52 ? 'refused' : expected >= -65 ? 'leak' : null);
+  }
+  const clean = song(0);
+  const result = Sound.checkTake(clean.left, clean.right, rate, 1, 0.25);
+  assert.ok(result.leakDb < -90 && result.verdict === null, `${rate}: чистая запись ${JSON.stringify(result)}`);
+  // На хлопках голоса нет: петь нельзя, если в микрофон попадает много звучащего.
+  const loud = song(0.03), faint = song(0.0003);
+  assert.ok(Sound.clapsLeak(loud.left, loud.right, rate, 0.25).refused);
+  assert.ok(!Sound.clapsLeak(faint.left, faint.right, rate, 0.25).refused);
 }
 
 console.log('sound.js: всё сходится');

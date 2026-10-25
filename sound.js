@@ -187,7 +187,218 @@
     return Math.max(0, first) / 10;
   }
 
+  // Подмес: фонограмма из наушников попала в микрофон. В левом канале она
+  // звучит с задержкой тракта и его окраской; ищется взвешенной регрессией
+  // голоса на правый канал, где вес кадра обратен его громкости: паузы весят
+  // больше пения, и голос не прячет тихий подмес. Те же шаги и числа — в
+  // app/layer_analyze.py бота, он проверяет запись ещё раз.
+  const LEAK_RATE = 8000, LEAK_FRAME = 800;   // 8 кГц, кадр 100 мс
+  const LEAK_WINDOW = 0.15;   // задержка подмеса — у сдвига по хлопкам, ± с
+  const LEAK_PRE = 2, LEAK_POST = 14;  // окраска тракта: отводы до и после задержки
+  const LEAK_STEADY = 0.01;   // задержка в двух половинах расходится не больше, с
+  // Пороги — по слуху Дмитрия (26.10.2026): подмес к голосу от −52 дБ — отказ,
+  // до −65 — предупреждение. На хлопках голоса ещё нет, там меряется доля
+  // звучащего в наушниках, попавшая в микрофон: у чистых записей −62 и тише,
+  // с подмесом −12…−28.
+  const LEAK_REFUSE_DB = -52, LEAK_WARN_DB = -65, CLAPS_LEAK_DB = -45;
+  const NOISE_WARN_DB = 30;   // пение громче тишины меньше чем на столько — шумно
+
+  // На 8 кГц: среднее по отрезку исходных отсчётов.
+  function downsample(x, rate) {
+    const step = rate / LEAK_RATE, out = new Float32Array(Math.floor(x.length / step));
+    for (let i = 0; i < out.length; i++) {
+      const a = Math.floor(i * step), b = Math.max(a + 1, Math.floor((i + 1) * step));
+      let s = 0;
+      for (let j = a; j < b; j++) s += x[j];
+      out[i] = s / (b - a);
+    }
+    return out;
+  }
+
+  function fft(re, im, inverse) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let size = 2; size <= n; size <<= 1) {
+      const angle = (inverse ? 2 : -2) * Math.PI / size, wr = Math.cos(angle), wi = Math.sin(angle);
+      for (let start = 0; start < n; start += size) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < size / 2; k++) {
+          const a = start + k, b = a + size / 2;
+          const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - tr; im[b] = im[a] - ti;
+          re[a] += tr; im[a] += ti;
+          const next = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr;
+          cr = next;
+        }
+      }
+    }
+  }
+
+  function solve(a, b) {
+    const n = b.length, m = a.map((row, i) => row.concat([b[i]]));
+    for (let c = 0; c < n; c++) {
+      let p = c;
+      for (let r = c + 1; r < n; r++) if (Math.abs(m[r][c]) > Math.abs(m[p][c])) p = r;
+      const top = m[c]; m[c] = m[p]; m[p] = top;
+      for (let r = c + 1; r < n; r++) {
+        const f = m[r][c] / m[c][c];
+        for (let k = c; k <= n; k++) m[r][k] -= f * m[c][k];
+      }
+    }
+    const x = new Array(n).fill(0);
+    for (let r = n - 1; r >= 0; r--) {
+      let s = m[r][n];
+      for (let k = r + 1; k < n; k++) s -= m[r][k] * x[k];
+      x[r] = s / m[r][r];
+    }
+    return x;
+  }
+
+  const sum = xs => xs.reduce((s, x) => s + x, 0);
+  const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+
+  // Подмес на 8 кГц: уровень к голосу и к правому каналу, дБ, задержка, с, и
+  // держится ли она в обеих половинах записи.
+  function measureLeak(voice, right, clapsShift) {
+    const R = LEAK_RATE, F = LEAK_FRAME, taps = LEAK_PRE + LEAK_POST;
+    const frames = Math.floor(Math.min(voice.length, right.length) / F), n = frames * F;
+    let lo = LEAK_PRE, hi = R;
+    if (clapsShift != null) {
+      lo = Math.max(LEAK_PRE, Math.round((clapsShift - LEAK_WINDOW) * R));
+      hi = Math.max(lo + 1, Math.round((clapsShift + LEAK_WINDOW) * R));
+    }
+    const none = { leakDb: -200, gainDb: -200, lag: null, steady: false };
+    if (!frames) return none;
+
+    const power = new Float64Array(frames);
+    for (let t = 0; t < n; t++) power[Math.floor(t / F)] += voice[t] * voice[t];
+    if (!power.some(p => p > 0)) return none;
+    const floor = Math.max(Array.from(power).sort((p, q) => p - q)[Math.floor(0.05 * (frames - 1))], 1e-9 * F);
+    const weight = Array.from(power, p => 1 / (p + floor));
+
+    // Взвешенная корреляция голоса с правым каналом на задержках окна,
+    // кусками через FFT, отдельно по половинам записи.
+    const width = hi - lo + 1;
+    const size = 1 << Math.ceil(Math.log2(Math.max(16384, 2 * width)));
+    const block = size - width + 1, halves = [new Float64Array(width), new Float64Array(width)];
+    for (let start = 0; start < n; start += block) {
+      const len = Math.min(block, n - start);
+      const ar = new Float64Array(size), ai = new Float64Array(size);
+      const br = new Float64Array(size), bi = new Float64Array(size);
+      for (let t = 0; t < len; t++) ar[t] = voice[start + t] * weight[Math.floor((start + t) / F)];
+      // b[t + m] — правый канал на hi - m раньше голоса.
+      for (let i = 0; i < len + width - 1; i++) {
+        const at = start + i - hi;
+        br[i] = at >= 0 && at < n ? right[at] : 0;
+      }
+      fft(ar, ai, false);
+      fft(br, bi, false);
+      for (let i = 0; i < size; i++) {
+        const r = ar[i] * br[i] + ai[i] * bi[i], m = ar[i] * bi[i] - ai[i] * br[i];
+        ar[i] = r; ai[i] = m;
+      }
+      fft(ar, ai, true);
+      const part = halves[Math.floor(start / F) < frames / 2 ? 0 : 1];
+      for (let j = 0; j < width; j++) part[j] += ar[width - 1 - j] / size;
+    }
+    const best = c => { let at = 0; for (let j = 1; j < c.length; j++) if (Math.abs(c[j]) > Math.abs(c[at])) at = j; return at; };
+    const total = halves[0].map((x, j) => x + halves[1][j]);
+    const lag = lo + best(total);
+    const lags = halves.map(c => (c.some(x => x) ? lo + best(c) : lag));
+
+    // На найденной задержке — по кадрам корреляции голоса с отводами и
+    // правого канала с самим собой; дальше всё считается только по ним.
+    const first = lag - LEAK_PRE, cross = [], auto = [];
+    for (let f = 0; f < frames; f++) {
+      const c = new Float64Array(taps), a = new Float64Array(taps);
+      for (let t = f * F; t < (f + 1) * F; t++) {
+        // u(t - k) — правый канал на first + k раньше голоса.
+        const at = t - first, v = voice[t], u0 = at >= 0 ? right[at] : 0;
+        for (let k = 0; k < taps && at - k >= 0; k++) {
+          const uk = right[at - k];
+          c[k] += v * uk;
+          a[k] += u0 * uk;
+        }
+      }
+      cross.push(c);
+      auto.push(a);
+    }
+
+    let weights = weight, leak = [];
+    for (let round = 0; round < 3; round++) {
+      const r = new Float64Array(taps), b = new Float64Array(taps);
+      for (let f = 0; f < frames; f++) {
+        for (let k = 0; k < taps; k++) { r[k] += weights[f] * auto[f][k]; b[k] += weights[f] * cross[f][k]; }
+      }
+      const matrix = [];
+      for (let i = 0; i < taps; i++) {
+        matrix.push(Array.from({ length: taps }, (_, j) => r[Math.abs(i - j)] + (i === j ? 1e-9 * Math.max(r[0], 1e-30) : 0)));
+      }
+      const h = solve(matrix, Array.from(b));
+      const hh = Array.from({ length: taps }, (_, m) => {
+        let s = 0;
+        for (let j = 0; j + m < taps; j++) s += h[j] * h[j + m];
+        return m ? 2 * s : s;
+      });
+      leak = auto.map(a => dot(a, hh));
+      weights = leak.map((l, f) => 1 / (Math.max(power[f] - 2 * dot(cross[f], h) + l, 0) + floor));
+    }
+
+    let rightPower = 0;
+    for (let t = 0; t < n; t++) rightPower += right[t] * right[t];
+    const leakPower = Math.max(sum(leak), 1e-30);
+    return {
+      leakDb: 10 * Math.log10(leakPower / sum(power)),
+      gainDb: rightPower > 0 ? 10 * Math.log10(leakPower / rightPower) : -200,
+      lag: lag / R,
+      steady: Math.abs(lags[0] - lags[1]) <= LEAK_STEADY * R,
+    };
+  }
+
+  // Насколько пение громче тишины до фонограммы, дБ: как бот меряет шум.
+  function noiseMargin(voice, start) {
+    const R = LEAK_RATE, F = R / 10, frames = [];
+    for (let i = Math.round(start * R); i + F <= voice.length; i += F) {
+      let s = 0;
+      for (let j = i; j < i + F; j++) s += voice[j] * voice[j];
+      frames.push(s / F);
+    }
+    const sung = frames.slice().sort((p, q) => p - q)[Math.floor(frames.length * 0.8)] || 0;
+    let quiet = 0, count = 0;
+    for (let i = Math.round(0.2 * R); i < Math.round((start - 0.05) * R); i++) { quiet += voice[i] * voice[i]; count++; }
+    return 10 * Math.log10((sung + 1e-20) / (quiet / Math.max(count, 1) + 1e-20));
+  }
+
+  // Хлопки: попадает ли мелодия из наушников в микрофон так, что петь нельзя.
+  function clapsLeak(left, right, rate, clapsShift) {
+    const leak = measureLeak(downsample(left, rate), downsample(right, rate), clapsShift);
+    return Object.assign(leak, { refused: leak.steady && leak.gainDb >= CLAPS_LEAK_DB });
+  }
+
+  // Песня: 'refused' — в хор нельзя, 'leak' — может быть подмес, 'noise' —
+  // шумно, null — чисто.
+  function checkTake(left, right, rate, start, clapsShift) {
+    const voice = downsample(left, rate);
+    const leak = measureLeak(voice, downsample(right, rate), clapsShift);
+    const margin = noiseMargin(voice, start);
+    let verdict = null;
+    if (leak.steady && leak.leakDb >= LEAK_REFUSE_DB) verdict = 'refused';
+    else if (leak.leakDb >= LEAK_WARN_DB) verdict = 'leak';
+    else if (margin < NOISE_WARN_DB) verdict = 'noise';
+    return Object.assign(leak, { margin, verdict });
+  }
+
   Object.assign(exports, {
     BEAT, MELODIES, clapsTune, findStart, clapsLatency, levels, loudness, singingStart,
+    downsample, measureLeak, clapsLeak, checkTake,
   });
 })(typeof module === 'object' ? module.exports : (window.Sound = {}));
