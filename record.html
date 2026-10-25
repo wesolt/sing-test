@@ -28,6 +28,7 @@
 <button id="b-mic">🎤 Включить микрофон</button>
 <select id="mic-pick" class="hidden"></select>
 <div id="meter"><div></div></div>
+<p class="hint" id="mic-info"></p>
 
 <h4>1. Хлопки</h4>
 <p class="hint">15 секунд. Хлопай громко в каждый удар — там нота громче всего и сменяется.</p>
@@ -94,6 +95,32 @@ let sources = [], tune = null, claps = null, recBlob = null, take = null, listen
 $('title').textContent = `🥐 ${query.get('title') || 'Слоёная песня'}`;
 log('открыто:', launch.get('tgWebAppPlatform') || 'браузер', navigator.userAgent);
 
+// Диагностика микрофона под кнопкой: у Саши на Маке (Telegram Desktop 7.3.3,
+// 25.10.2026) вопрос «разрешить микрофон?» не появлялся и запрос висел без
+// ответа. По строке видно, дошло ли нажатие, сколько ждём и что думает система.
+// Синтаксис не новее ES2018: там же оказалась macOS 10.13 со старым WebKit, и
+// `?.` или `catch {}` роняли весь скрипт — кнопка оставалась без обработчика.
+const PERMISSION = { granted: 'разрешён', denied: 'запрещён', prompt: 'спросит' };
+let permission = 'не узнать';
+if (navigator.permissions) {
+  navigator.permissions.query({ name: 'microphone' }).then(p => {
+    const update = () => { permission = PERMISSION[p.state] || p.state; log('доступ к микрофону:', p.state); };
+    update();
+    p.onchange = update;
+  }).catch(e => log('доступ к микрофону не узнать', e.name));
+}
+let micWait;
+const micInfo = text => {
+  $('mic-info').textContent = `${text} · доступ: ${permission} · окно ${document.visibilityState === 'visible' ? 'видно' : 'скрыто'}`
+    + `, фокус ${document.hasFocus() ? 'да' : 'нет'} · ${launch.get('tgWebAppPlatform') || 'браузер'} ${launch.get('tgWebAppVersion') || ''}`;
+};
+// Запись звука (MediaRecorder) в WebKit есть только с Safari 14.1.
+const cannot = [navigator.mediaDevices ? '' : 'микрофон', window.MediaRecorder ? '' : 'запись звука'].filter(Boolean);
+if (cannot.length) {
+  micInfo(`окошко не умеет: ${cannot.join(', ')}`);
+  log('не умеет:', cannot.join(', '));
+}
+
 // Текст песни прислал запускающий: под сопровождение слов в фонограмме нет.
 if (query.get('lyrics')) {
   fetch(query.get('lyrics'))
@@ -128,7 +155,7 @@ function audio() {
 }
 
 function stopAll() {
-  sources.forEach(s => { try { s.stop(); } catch { /* уже остановлен */ } });
+  sources.forEach(s => { try { s.stop(); } catch (e) { /* уже остановлен */ } });
   sources = [];
 }
 
@@ -181,13 +208,21 @@ async function openMic(deviceId) {
   if (claps) status('Микрофон сменился — похлопай ещё раз.');
   claps = null;
   updateButtons();
+  const asked = Date.now(), waited = () => Math.round((Date.now() - asked) / 1000);
+  clearInterval(micWait);
+  micInfo('микрофон запрошен');
+  log('микрофон запрошен');
+  micWait = setInterval(() => micInfo(`ждём ответа ${waited()} с`), 1000);
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: deviceId ? { ...RAW, deviceId: { exact: deviceId } } : RAW });
   } catch (e) {
+    clearInterval(micWait);
+    micInfo(`отказ через ${waited()} с: ${e.name} ${e.message}`);
     log('микрофон не дали', e.name, e.message);
     status('Нет доступа к микрофону. Разреши его и открой страницу заново.');
     return;
   }
+  clearInterval(micWait);
   // Запись в два канала: левый — голос, правый — звук ровно так, как он
   // ушёл в наушники. По правому каналу видно, где он начался.
   const mic = ctx.createMediaStreamSource(stream);
@@ -211,6 +246,7 @@ async function openMic(deviceId) {
     pick.add(new Option(`🎤 ${d.label || 'микрофон'}`, d.deviceId, false, d.deviceId === current)));
   pick.classList.remove('hidden');
   log('микрофон:', track.label);
+  micInfo(`включён за ${waited()} с`);
 
   $('b-mic').textContent = '🎤 Микрофон включён';
   $('b-mic').dataset.warming = '1';
@@ -259,7 +295,7 @@ async function record(button, buffer, tail, label, onDone) {
     onDone(blob).catch(e => { log(label, 'разбор', e.message); status('Запись не разобралась. Попробуй ещё раз.'); });
   };
 
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* не везде есть */ }
+  try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* не везде есть */ }
   recording = true;
   button.classList.add('live');
   updateButtons();
