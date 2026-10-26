@@ -148,6 +148,11 @@ if (query.get('lyrics')) {
     .catch(e => log('текст песни не скачался', e.message));
 }
 
+// Тренировка: всё как в раунде, только запись уходит себе в личку — без
+// голоса своими словами и без хора. Бот присылает два аудио и удаляет запись.
+const PRACTICE = query.get('practice') === '1';
+if (PRACTICE) $('b-send').textContent = '📥 Получить в лс';
+
 // Старая ссылка «Проверить звук»: хлопки теперь часть записи.
 if (query.get('mode') === 'claps') {
   $('title').textContent = '🔊 Проверка звука';
@@ -209,10 +214,11 @@ function updateButtons() {
   $('b-claps').disabled = !ready || busy('b-claps');
   $('b-rec').disabled = !ready || !claps || busy('b-rec');
   // Пока запись проверяется или в ней фонограмма, отправить нельзя.
-  $('b-send').disabled = recording || !recBlob || !part || listened < MIN_LISTEN ||
+  $('b-send').disabled = recording || !recBlob || (!part && !PRACTICE) || listened < MIN_LISTEN ||
     !take.check || take.check.verdict === 'refused';
   const left = Math.ceil(MIN_LISTEN - listened);
-  $('listen-left').textContent = take && left > 0 ? `Послушай ещё ${left} с — потом можно отправить.` : '';
+  $('listen-left').textContent = take && left > 0
+    ? `Послушай ещё ${left} с — потом можно ${PRACTICE ? 'получить в лс' : 'отправить'}.` : '';
 }
 
 function closeMic() {
@@ -401,8 +407,8 @@ $('b-rec').onclick = async () => {
     showShift();
     $('voice-box').classList.remove('hidden');
     $('listen-box').classList.remove('hidden');
-    $('part-box').classList.remove('hidden');
-    status('Послушай, как лёг голос, напиши, какой голос пел, и отправь.');
+    if (!PRACTICE) $('part-box').classList.remove('hidden');
+    status(PRACTICE ? 'Послушай, как лёг голос, и получи в лс.' : 'Послушай, как лёг голос, напиши, какой голос пел, и отправь.');
     showCheck();
     updateButtons();
     // Проверка на подмес и шум — несколько секунд: страница показывается
@@ -494,7 +500,7 @@ $('b-send').onclick = async () => {
   status('Отправляю…');
   const track = stream && stream.getAudioTracks()[0];
   const meta = {
-    mode: 'song',
+    mode: PRACTICE ? 'practice' : 'song',
     part,
     mic: micName(track && track.label),
     shift: take.shift,
@@ -519,7 +525,9 @@ $('b-send').onclick = async () => {
       const response = await fetch(query.get('post'), { method: 'POST', body: form });
       if (!response.ok) throw new Error(`хранилище ответило ${response.status}`);
     }
-    status('✅ Отправлено. Бот пришлёт слой в личку. Страницу можно закрыть.');
+    status(PRACTICE
+      ? '✅ Отправлено. Бот пришлёт оба аудио в личку за пару минут. Можно спеть ещё раз.'
+      : '✅ Отправлено. Бот пришлёт слой в личку. Страницу можно закрыть.');
   } catch (e) {
     log('не отправилось', e.message);
     status('Не отправилось. Проверь интернет и нажми ещё раз.');
